@@ -47,20 +47,27 @@ class AgentDomainService:
         await self._task_cls.destroy()
         logger.info("All agents closed successfully")
 
-    async def _create_task(self, session: Session) -> Task:
-        """Create a new agent task"""
+    async def _get_or_create_sandbox_for_session(self, session: Session) -> Sandbox:
+        """Get or create a sandbox for the given session."""
         sandbox = None
         sandbox_id = session.sandbox_id
         if sandbox_id:
             sandbox = await self._sandbox_cls.get(sandbox_id)
         if not sandbox:
-            sandbox = await self._sandbox_cls.create()
+            logger.info(f"No sandbox found for session {session.id}, creating a new one.")
+            sandbox = await self._sandbox_cls.create(session_id=session.id)
             session.sandbox_id = sandbox.id
             await self._session_repository.save(session)
+            logger.info(f"New sandbox {sandbox.id} created and associated with session {session.id}.")
+        return sandbox
+
+    async def _create_task(self, session: Session) -> Task:
+        """Create a new agent task"""
+        sandbox = await self._get_or_create_sandbox_for_session(session)
         browser = await sandbox.get_browser()
         if not browser:
-            logger.error(f"Failed to get browser for Sandbox {sandbox_id}")
-            raise RuntimeError(f"Failed to get browser for Sandbox {sandbox_id}")
+            logger.error(f"Failed to get browser for Sandbox {sandbox.id}")
+            raise RuntimeError(f"Failed to get browser for Sandbox {sandbox.id}")
         
         await self._session_repository.save(session)
 

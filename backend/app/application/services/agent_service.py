@@ -3,6 +3,9 @@ import logging
 from datetime import datetime
 from app.domain.models.session import Session
 from app.domain.repositories.session_repository import SessionRepository
+from fastapi import WebSocket, WebSocketDisconnect
+import asyncio
+from fastapi import Depends
 
 from app.interfaces.schemas.response import ShellViewResponse, FileViewResponse, GetSessionResponse
 from app.domain.models.agent import Agent
@@ -196,3 +199,26 @@ class AgentService:
         result = await sandbox.file_read(path)
         logger.info(f"File read successfully: {path}")
         return FileViewResponse(**result.data)
+
+    async def stream_trace(self, session_id: str, websocket: WebSocket):
+        """Streams Playwright trace data to the client."""
+        logger.info(f"Trace stream requested for session {session_id}. Ensuring sandbox exists.")
+        session = await self.get_session(session_id)
+        sandbox = await self._agent_domain_service._get_or_create_sandbox_for_session(session)
+        logger.info(f"Sandbox {sandbox.id} is ready for session {session_id}. Starting trace stream.")
+        await sandbox.stream_trace(websocket)
+
+    async def direct_navigate(self, session_id: str, url: str):
+        """Directly navigate the browser to a URL, bypassing the agent."""
+        logger.info(f"Direct navigation for session {session_id} to URL: {url}")
+        
+        # Ensure session exists
+        session = await self.get_session(session_id)
+        
+        # Ensure sandbox is created for the session
+        sandbox = await self._agent_domain_service._get_or_create_sandbox_for_session(session)
+        
+        browser = await sandbox.get_browser()
+        result = await browser.navigate(url)
+        logger.info(f"Direct navigation result for session {session_id}: {result}")
+        return result

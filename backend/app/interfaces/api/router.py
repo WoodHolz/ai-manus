@@ -1,24 +1,20 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Request
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
 from sse_starlette.sse import EventSourceResponse
-from typing import AsyncGenerator, Dict, Any, List
+from typing import AsyncGenerator
 from sse_starlette.event import ServerSentEvent
 from datetime import datetime
 import asyncio
 import websockets
 import logging
 from app.application.services.agent_service import AgentService
-from app.interfaces.schemas.request import ChatRequest, FileViewRequest, ShellViewRequest
+from app.dependencies import get_agent_service
+from app.interfaces.schemas.request import ChatRequest, FileViewRequest, ShellViewRequest, NavigateRequest
 from app.interfaces.schemas.response import APIResponse, CreateSessionResponse, GetSessionResponse, ShellViewResponse, FileViewResponse, ListSessionItem, ListSessionResponse
 from app.interfaces.schemas.event import SSEEventFactory
 
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-def get_agent_service() -> AgentService:
-    # Placeholder for dependency injection
-    return None
 
 @router.put("/sessions", response_model=APIResponse[CreateSessionResponse])
 async def create_session(
@@ -101,16 +97,22 @@ async def chat(
     return EventSourceResponse(event_generator()) 
 
 
+@router.post("/sessions/{session_id}/navigate", response_model=APIResponse[None])
+async def direct_navigate(
+    session_id: str,
+    request: NavigateRequest,
+    agent_service: AgentService = Depends(get_agent_service)
+) -> APIResponse[None]:
+    await agent_service.direct_navigate(session_id, request.url)
+    return APIResponse.success()
+
+
 @router.post("/sessions/{session_id}/shell", response_model=APIResponse[ShellViewResponse])
 async def view_shell(
     session_id: str,
     request: ShellViewRequest,
     agent_service: AgentService = Depends(get_agent_service)
 ) -> APIResponse[ShellViewResponse]:
-    """View shell session output
-    
-    If the agent does not exist or fails to get shell output, an appropriate exception will be thrown and handled by the global exception handler
-    """
     result = await agent_service.shell_view(session_id, request.session_id)
     return APIResponse.success(result)
 
@@ -121,17 +123,6 @@ async def view_file(
     request: FileViewRequest,
     agent_service: AgentService = Depends(get_agent_service)
 ) -> APIResponse[FileViewResponse]:
-    """View file content
-    
-    If the agent does not exist or fails to get file content, an appropriate exception will be thrown and handled by the global exception handler
-    
-    Args:
-        agent_id: Agent ID
-        file: File path
-        
-    Returns:
-        APIResponse containing file content
-    """
     result = await agent_service.file_view(session_id, request.file)
     return APIResponse.success(result)
 
@@ -142,28 +133,15 @@ async def vnc_websocket(
     session_id: str,
     agent_service: AgentService = Depends(get_agent_service)
 ) -> None:
-    """VNC WebSocket endpoint (binary mode)
-    
-    Establishes a connection with the VNC WebSocket service in the sandbox environment and forwards data bidirectionally
-    
-    Args:
-        websocket: WebSocket connection
-        session_id: Session ID
-    """
-    
     await websocket.accept(subprotocol="binary")
     
     try:
-    
-        # Get sandbox environment address
         sandbox_ws_url = await agent_service.get_vnc_url(session_id)
-
         logger.info(f"Connecting to VNC WebSocket at {sandbox_ws_url}")
     
-        # Connect to sandbox WebSocket
         async with websockets.connect(sandbox_ws_url) as sandbox_ws:
             logger.info(f"Connected to VNC WebSocket at {sandbox_ws_url}")
-            # Create two tasks to forward data bidirectionally
+
             async def forward_to_sandbox():
                 try:
                     while True:
@@ -186,11 +164,9 @@ async def vnc_websocket(
                 except Exception as e:
                     logger.error(f"Error forwarding data from sandbox: {e}")
             
-            # Run two forwarding tasks concurrently
             forward_task1 = asyncio.create_task(forward_to_sandbox())
             forward_task2 = asyncio.create_task(forward_from_sandbox())
             
-            # Wait for either task to complete (meaning connection has closed)
             done, pending = await asyncio.wait(
                 [forward_task1, forward_task2],
                 return_when=asyncio.FIRST_COMPLETED
@@ -198,7 +174,6 @@ async def vnc_websocket(
 
             logger.info("WebSocket connection closed")
             
-            # Cancel pending tasks
             for task in pending:
                 task.cancel()
     
@@ -208,3 +183,25 @@ async def vnc_websocket(
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}")
         await websocket.close(code=1011, reason=f"WebSocket error: {str(e)}")
+
+
+@router.websocket("/sessions/{session_id}/trace")
+async def trace_websocket(
+    websocket: WebSocket,
+    session_id: str,
+    agent_service: AgentService = Depends(get_agent_service)
+) -> None:
+    await websocket.accept()
+    logger.info(f"Accepted trace websocket connection for session {session_id}")
+
+    try:
+        # This function will handle the logic of streaming trace data
+        await agent_service.stream_trace(session_id, websocket)
+
+    except WebSocketDisconnect:
+        logger.info(f"Trace websocket disconnected for session {session_id}")
+    except Exception as e:
+        logger.error(f"Trace websocket error for session {session_id}: {str(e)}")
+        await websocket.close(code=1011, reason=f"WebSocket error: {str(e)}")
+    finally:
+        logger.info(f"Closing trace websocket for session {session_id}")
