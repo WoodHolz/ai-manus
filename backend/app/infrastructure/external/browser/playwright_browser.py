@@ -22,7 +22,7 @@ class PlaywrightBrowser:
         self.cdp_url = cdp_url
         self.proxy = proxy
         self._trace_events_queue = trace_events_queue
-        self._cdp_session = None
+        self._event_handlers: Dict[str, Any] = {}
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -122,53 +122,117 @@ class PlaywrightBrowser:
             self.page = None
             self.browser = None
             self.playwright = None
-            if self._cdp_session:
-                try:
-                    await self._cdp_session.detach()
-                except Exception as e:
-                    logger.warning(f"Failed to detach CDP session during cleanup: {e}")
-                self._cdp_session = None
     
+    async def _serialize_payload(self, event_name: str, payload: Any) -> Optional[Dict[str, Any]]:
+        """Serialize playwright event payloads into JSON-compatible dictionaries."""
+        if payload is None:
+            return None
+            
+        serialized = {}
+        if event_name in ["request", "requestfinished", "requestfailed"]:
+            try:
+                # payload is a Request object
+                serialized = {
+                    "url": payload.url,
+                    "method": payload.method,
+                    "headers": await payload.all_headers(),
+                    "post_data": payload.post_data,
+                }
+                if event_name == "requestfailed":
+                    serialized["failure"] = payload.failure.text if payload.failure else "Unknown failure"
+            except Exception as e:
+                logger.warning(f"Could not fully serialize request payload for url {getattr(payload, 'url', 'N/A')}: {e}")
+                serialized['error'] = str(e)
+
+        elif event_name == "response":
+            try:
+                # payload is a Response object
+                serialized = {
+                    "url": payload.url,
+                    "status": payload.status,
+                    "status_text": payload.status_text,
+                    "headers": await payload.all_headers(),
+                }
+            except Exception as e:
+                logger.warning(f"Could not fully serialize response payload for url {getattr(payload, 'url', 'N/A')}: {e}")
+                serialized['error'] = str(e)
+                
+        elif event_name == "framenavigated":
+            try:
+                # payload is a Frame object
+                serialized = {
+                    "url": payload.url,
+                    "name": payload.name or "",
+                }
+            except Exception as e:
+                logger.warning(f"Could not fully serialize frame payload for url {getattr(payload, 'url', 'N/A')}: {e}")
+                serialized['error'] = str(e)
+
+        elif event_name == "load" or event_name == "domcontentloaded":
+            # These events have no payload, but are very important.
+            # We can snapshot the page's main frame content.
+            try:
+                serialized = {
+                    "url": self.page.url,
+                    "title": await self.page.title(),
+                    "html": await self.page.content() # Return the full HTML
+                }
+            except Exception as e:
+                logger.warning(f"Could not get page content on '{event_name}': {e}")
+                serialized['error'] = str(e)
+        
+        # For other events, we can just convert them to string for now
+        else:
+            try:
+                serialized = {"info": str(payload)}
+            except Exception:
+                serialized = {"info": "Payload not serializable"}
+
+        return serialized
+
     async def start_tracing(self) -> None:
         """Start tracing by listening to high-level Playwright events."""
         if not self.page:
             logger.error("Cannot start tracing without a page.")
             return
 
-        # Define a generic handler
-        def create_handler(event_name):
-            def handler(payload):
+        def create_handler(event_name: str):
+            async def handler(payload: Any):
                 try:
-                    # For simplicity, we'll just log the event name.
-                    # In a real scenario, you might want to serialize the payload.
-                    event_data = {"type": "playwright_event", "event": event_name, "url": self.page.url}
-                    asyncio.run_coroutine_threadsafe(self._trace_events_queue.put(event_data), self._loop)
-                    print(f"Playwright event captured and queued: {event_name} on {self.page.url}")
+                    serialized_payload = await self._serialize_payload(event_name, payload)
+                    event_data = {
+                        "type": f"browser.event.{event_name}",
+                        "data": {
+                            "page_url": self.page.url,
+                            "payload": serialized_payload
+                        }
+                    }
+                    if self._trace_events_queue and self._loop:
+                        asyncio.run_coroutine_threadsafe(self._trace_events_queue.put(event_data), self._loop)
+                        logger.debug(f"Playwright event captured and queued: {event_name}")
                 except Exception as e:
-                    print(f"Error handling playwright event {event_name}: {e}")
+                    logger.error(f"Error handling playwright event {event_name}: {e}", exc_info=True)
             return handler
 
-        # List of events to listen to
         events_to_listen = [
-            "close", "crash", "domcontentloaded", "download", "filechooser",
-            "frameattached", "framedetached", "framenavigated", "load", "pageerror",
-            "popup", "request", "requestfailed", "requestfinished", "response", "websocket"
+            "close", "domcontentloaded", "framenavigated", "load",
+            "request", "response"
         ]
         
         # Clear existing listeners to avoid duplicates
-        if hasattr(self, '_event_handlers'):
-            for event, handler in self._event_handlers.items():
+        if self._event_handlers:
+            for event, handler_ref in self._event_handlers.items():
                 try:
-                    self.page.remove_listener(event, handler)
+                    self.page.remove_listener(event, handler_ref)
                 except Exception as e:
                     logger.warning(f"Could not remove listener for {event}: {e}")
+        self._event_handlers.clear()
 
         # Attach new listeners
-        self._event_handlers = {}
         for event_name in events_to_listen:
-            handler = create_handler(event_name)
-            self._event_handlers[event_name] = handler
-            self.page.on(event_name, handler)
+            handler_ref = create_handler(event_name)
+            self._event_handlers[event_name] = handler_ref
+            self.page.on(event_name, handler_ref)
         
         logger.info(f"Attached high-level Playwright event listeners to page: {self.page.url}")
 
@@ -676,49 +740,39 @@ class PlaywrightBrowser:
         return ToolResult(success=True, data={"logs": logs})
 
     async def get_next_trace_event(self) -> Optional[Dict[str, Any]]:
-        """Get the next trace event from the queue."""
+        """Get the next event from the trace queue (non-blocking)."""
         if self._trace_events_queue.empty():
             return None
         return await self._trace_events_queue.get()
 
-    async def _on_event(self, event_type: str, event_payload):
-        """Unified event handler for high-level Playwright events."""
-        url = ""
-        try:
-            # Attempt to get the URL from the event payload, specific to event type
-            if hasattr(event_payload, 'url'):
-                url = event_payload.url
-            elif hasattr(event_payload, 'request') and hasattr(event_payload.request, 'url'):
-                url = event_payload.request.url
-            elif hasattr(event_payload, 'frame'):
-                url = event_payload.frame.url
-        except Exception:
-            # Some events might not have a URL or might be structured differently
-            pass
-        
-        event_data = {
-            "type": "playwright_event",
-            "event": event_type,
-            "url": url
-        }
-        
-        # Using run_coroutine_threadsafe for thread safety from Playwright's sync context
-        if self._loop:
-            future = asyncio.run_coroutine_threadsafe(self._trace_events_queue.put(event_data), self._loop)
-            try:
-                future.result(timeout=5)  # Add a timeout to prevent indefinite blocking
-            except Exception as e:
-                logger.error(f"Error queuing Playwright event: {e}")
+    async def extract_and_send_event(self, selector: str, event_id: str):
+        """Finds an element, extracts its content, and sends a trace event."""
+        if not self.page:
+            logger.error("Cannot extract data without a page.")
+            return
 
-    async def _attach_page_listeners(self, page: Page):
-        """Attach all high-level event listeners to the page."""
-        event_types = [
-            "close", "console", "crash", "dialog", "domcontentloaded", "download",
-            "filechooser", "frameattached", "framedetached", "framenavigated",
-            "load", "pageerror", "popup", "request", "requestfailed",
-            "requestfinished", "response", "worker"
-        ]
-        for event_type in event_types:
-            # Use a lambda to capture the current event_type
-            page.on(event_type, lambda payload, et=event_type: self._on_event(et, payload))
-        logger.info(f"Attached high-level Playwright event listeners to page: {page.url}")
+        try:
+            element = self.page.locator(selector).first
+            if not await element.is_visible():
+                logger.warning(f"Element with selector '{selector}' not visible for extraction.")
+                return
+
+            text_content = await element.text_content()
+            html_content = await element.inner_html()
+            
+            event_data = {
+                "type": "browser.element.extracted",
+                "event_id": event_id,
+                "data": {
+                    "selector": selector,
+                    "text_content": text_content.strip() if text_content else "",
+                    "html_content": html_content,
+                    "page_url": self.page.url,
+                }
+            }
+            if self._trace_events_queue and self._loop:
+                asyncio.run_coroutine_threadsafe(self._trace_events_queue.put(event_data), self._loop)
+                logger.info(f"Successfully extracted element and queued event: {selector}")
+
+        except Exception as e:
+            logger.error(f"Failed to extract or send event for selector '{selector}': {e}", exc_info=True)

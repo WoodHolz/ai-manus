@@ -219,6 +219,24 @@ class AgentService:
         sandbox = await self._agent_domain_service._get_or_create_sandbox_for_session(session)
         
         browser = await sandbox.get_browser()
-        result = await browser.navigate(url)
-        logger.info(f"Direct navigation result for session {session_id}: {result}")
-        return result
+        navigate_result = await browser.navigate(url)
+        logger.info(f"Direct navigation result for session {session_id}: {navigate_result}")
+
+        # --- Start of Hard-coded Script ---
+        # For demonstration, we'll run a simple extraction script after navigation
+        # In a real scenario, this would be driven by the AI agent's plan.
+        if "books.toscrape.com" in url:
+            logger.info(f"books.toscrape.com detected. Running extraction script for session {session_id}.")
+            # Wait for the page to be ready
+            await asyncio.sleep(3) 
+
+            # Define the selector for the element to be extracted
+            selector = "article.product_pod > h3 > a"
+            event_id = "extract_first_book_title"
+            
+            # Call the new extraction method
+            await browser.extract_and_send_event(selector=selector, event_id=event_id)
+            logger.info(f"Extraction script finished for session {session_id}.")
+        # --- End of Hard-coded Script ---
+
+        return navigate_result
