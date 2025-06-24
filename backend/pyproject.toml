@@ -5,9 +5,21 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13.3"
 dependencies = [
+    "async-lru>=2.0.5",
+    "beanie>=1.30.0",
+    "docker>=7.1.0",
     "fastapi>=0.115.13",
+    "httpx>=0.28.1",
+    "markdownify>=1.1.0",
+    "motor>=3.7.1",
+    "openai>=1.88.0",
     "playwright>=1.52.0",
+    "pydantic-settings>=2.9.1",
+    "pymongo>=4.13.2",
     "python-multipart>=0.0.20",
+    "redis>=6.2.0",
+    "rich>=14.0.0",
+    "sse-starlette>=2.3.6",
     "uvicorn>=0.34.3",
     "websockets>=15.0.1",
 ]
