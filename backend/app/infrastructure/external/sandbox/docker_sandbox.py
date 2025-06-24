@@ -18,6 +18,8 @@ import json
 logger = logging.getLogger(__name__)
 
 class DockerSandbox(Sandbox):
+    _active_sandboxes: Dict[str, 'DockerSandbox'] = {}
+
     def __init__(self, ip: str = None, container_name: str = None, session_id: str = None):
         """Initialize Docker sandbox and API interaction client"""
         self.client = httpx.AsyncClient(timeout=600)
@@ -90,45 +92,13 @@ class DockerSandbox(Sandbox):
         name_prefix = settings.sandbox_name_prefix
         container_name = f"{name_prefix}-{str(uuid.uuid4())[:8]}"
         
-        try:
-            # Create Docker client
-            docker_client = docker.from_env()
-
-            # Prepare container configuration
-            container_config = {
-                "image": image,
-                "name": container_name,
-                "detach": True,
-                "auto_remove": True,
-                "environment": {
-                    "SERVICE_TIMEOUT_MINUTES": settings.sandbox_ttl_minutes,
-                    "CHROME_ARGS": settings.sandbox_chrome_args,
-                    "HTTPS_PROXY": settings.sandbox_https_proxy,
-                    "HTTP_PROXY": settings.sandbox_http_proxy,
-                    "NO_PROXY": settings.sandbox_no_proxy
-                }
-            }
-
-            # Add network to container config if configured
-            if settings.sandbox_network:
-                container_config["network"] = settings.sandbox_network
-            
-            # Create container
-            container = docker_client.containers.run(**container_config)
-            
-            # Get container IP address
-            container.reload()  # Refresh container info
-            ip_address = DockerSandbox._get_container_ip(container)
-            
-            # Create and return DockerSandbox instance
-            return DockerSandbox(
-                ip=ip_address,
-                container_name=container_name,
-                session_id=session_id
-            )
-            
-        except Exception as e:
-            raise Exception(f"Failed to create Docker sandbox: {str(e)}")
+        # We only create the sandbox object here, but do not run the container yet.
+        # The container will be started by the `start` method.
+        return DockerSandbox(
+            ip="127.0.0.1",  # Placeholder, will be updated after container starts
+            container_name=container_name,
+            session_id=session_id
+        )
 
     async def exec_command(self, session_id: str, exec_dir: str, command: str) -> ToolResult:
         response = await self.client.post(
@@ -376,6 +346,10 @@ class DockerSandbox(Sandbox):
     async def destroy(self) -> bool:
         """Destroy Docker sandbox"""
         try:
+            if self.id in DockerSandbox._active_sandboxes:
+                del DockerSandbox._active_sandboxes[self.id]
+                logger.info(f"Removed sandbox {self.id} from active instances.")
+
             if self.client:
                 await self.client.aclose()
             if self._container_name:
@@ -396,7 +370,12 @@ class DockerSandbox(Sandbox):
             Browser: Returns a configured PlaywrightBrowser instance
                     connected using the sandbox's CDP URL
         """
-        return PlaywrightBrowser(self.cdp_url)
+        if not self._browser:
+            self._browser = await PlaywrightBrowser.create(
+                cdp_url=self.cdp_url, 
+                trace_events_queue=self._trace_events_queue
+            )
+        return self._browser
 
     @classmethod
     async def create(cls, session_id: str) -> Sandbox:
@@ -404,12 +383,20 @@ class DockerSandbox(Sandbox):
         # This method is now a wrapper around the static _create_task method
         sandbox = cls._create_task(session_id)
         await sandbox.start()
+        cls._active_sandboxes[sandbox.id] = sandbox
+        logger.info(f"Sandbox {sandbox.id} created and added to active instances.")
         return sandbox
 
     @classmethod
     @alru_cache(maxsize=128, typed=True)
     async def get(cls, id: str) -> Optional[Sandbox]:
         """Get Docker sandbox instance by ID"""
+        # First, check our in-memory cache of active sandboxes
+        if id in cls._active_sandboxes:
+            logger.debug(f"Found active sandbox {id} in memory.")
+            return cls._active_sandboxes[id]
+
+        logger.warning(f"Sandbox {id} not found in active instances. Attempting to recover from Docker, but state like event queue will be new.")
         if not id:
             logger.error("Attempted to get sandbox with empty ID.")
             return None
@@ -419,6 +406,8 @@ class DockerSandbox(Sandbox):
             container = docker_client.containers.get(id)
             ip_address = DockerSandbox._get_container_ip(container)
             
+            # This path creates a new object, which will lose state (e.g., event queue).
+            # This should be used for recovery only.
             return DockerSandbox(
                 ip=ip_address,
                 container_name=id
@@ -432,29 +421,74 @@ class DockerSandbox(Sandbox):
             raise Exception(f"An unexpected error occurred while getting sandbox '{id}': {e}")
 
     async def start(self) -> None:
-        self.logger.info(f"Starting sandbox for session: {self.session_id}")
-        try:
-            # Set up environment for headed mode if not in production
-            extra_docker_args = {}
-            if os.getenv("ENV") != "production":
-                extra_docker_args = {
-                    "environment": [f"DISPLAY={os.getenv('DISPLAY')}"],
-                    "volumes": {"/tmp/.X11-unix": {"bind": "/tmp/.X11-unix", "mode": "rw"}},
-                }
+        self.logger.info(f"Starting sandbox container for session: {self.session_id}")
+        settings = get_settings()
+        docker_client = docker.from_env()
 
-            self.container = self.client.containers.run(
-                self.image_name,
-                detach=True,
-                auto_remove=True,
-                # network="host", # Use host network to easily connect to the exposed port
-                ports={f"{self.sandbox_port}/tcp": None},  # Let Docker assign a random host port
-                name=self.container_name,
-                **extra_docker_args,
-            )
-            self._wait_for_container_to_be_running()
-            self.host_port = self._get_container_host_port()
+        try:
+            # Prepare container configuration, including proxy settings
+            container_config = {
+                "image": settings.sandbox_image,
+                "name": self._container_name,
+                "detach": True,
+                "auto_remove": True,
+                "ports": {'8080/tcp': None, '5901/tcp': None, '9222/tcp': None},
+                "environment": {
+                    "SERVICE_TIMEOUT_MINUTES": settings.sandbox_ttl_minutes,
+                    "CHROME_ARGS": settings.sandbox_chrome_args,
+                    "HTTPS_PROXY": settings.sandbox_https_proxy,
+                    "HTTP_PROXY": settings.sandbox_http_proxy,
+                    "NO_PROXY": settings.sandbox_no_proxy
+                }
+            }
+
+            # Add network to container config if configured
+            if settings.sandbox_network:
+                container_config["network"] = settings.sandbox_network
+            
+            # Add display for headed mode if not in production
+            if os.getenv("ENV") != "production":
+                display = os.getenv('DISPLAY')
+                if display:
+                    container_config["environment"]["DISPLAY"] = display
+                    container_config["volumes"] = {"/tmp/.X11-unix": {"bind": "/tmp/.X11-unix", "mode": "rw"}}
+                else:
+                    self.logger.warning("DISPLAY environment variable not set. Running in headless mode.")
+
+
+            container = docker_client.containers.run(**container_config)
+            
+            # Get container IP address and update ports
+            container.reload()
+            
+            if settings.sandbox_network:
+                network_settings = container.attrs['NetworkSettings']['Networks'][settings.sandbox_network]
+                self.ip = network_settings['IPAddress']
+                self.base_url = f"http://{self.ip}:8080"
+                self._vnc_url = f"ws://{self.ip}:5901"
+                self._cdp_url = f"http://{self.ip}:9222"
+            else: # Bridge network or other, rely on port mapping
+                ports = container.attrs['NetworkSettings']['Ports']
+                self.ip = "127.0.0.1" # or Docker host IP
+                # Update base URL and other URLs based on dynamic ports
+                self.base_url = f"http://{self.ip}:{ports['8080/tcp'][0]['HostPort']}"
+                self._vnc_url = f"ws://{self.ip}:{ports['5901/tcp'][0]['HostPort']}"
+                self._cdp_url = f"http://{self.ip}:{ports['9222/tcp'][0]['HostPort']}"
+
+
+            self.logger.info(f"Sandbox container '{self._container_name}' started with IP: {self.ip} and urls: {self.base_url}, {self._vnc_url}, {self._cdp_url}")
+
         except Exception as e:
-            self.logger.error(f"Failed to start Docker sandbox: {str(e)}")
+            self.logger.error(f"Failed to start Docker sandbox: {str(e)}", exc_info=True)
+            # Ensure container is removed on failure
+            try:
+                existing_container = docker_client.containers.get(self._container_name)
+                existing_container.remove(force=True)
+            except docker.errors.NotFound:
+                pass # It might have failed before creation
+            except Exception as cleanup_e:
+                self.logger.error(f"Failed to cleanup container on startup error: {cleanup_e}")
+            raise  # Re-raise the original exception
 
     async def _launch_browser(self, config: dict) -> None:
         self.logger.info("Launching browser in sandbox")

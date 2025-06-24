@@ -13,14 +13,29 @@ logger = logging.getLogger(__name__)
 class PlaywrightBrowser:
     """Playwright client that provides specific implementation of browser operations"""
     
-    def __init__(self, cdp_url: str):
+    def __init__(self, cdp_url: str, trace_events_queue: asyncio.Queue, proxy: Optional[Dict[str, str]] = None):
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
         self.playwright = None
         self.llm = OpenAILLM()
         self.settings = get_settings()
         self.cdp_url = cdp_url
+        self.proxy = proxy
+        self._trace_events_queue = trace_events_queue
+        self._cdp_session = None
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("No running event loop, creating a new one.")
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
         
+    @classmethod
+    async def create(cls, cdp_url: str, trace_events_queue: asyncio.Queue, proxy: Optional[Dict[str, str]] = None):
+        instance = cls(cdp_url, trace_events_queue, proxy)
+        await instance.initialize()
+        return instance
+
     async def initialize(self):
         """Initialize and ensure resources are available"""
         # Add retry logic
@@ -52,6 +67,10 @@ class PlaywrightBrowser:
                     # Create a new page in other cases
                     context = contexts[0] if contexts else await self.browser.new_context()
                     self.page = await context.new_page()
+                
+                # Start tracing: connect to CDP
+                await self.start_tracing()
+                
                 return True
             except Exception as e:
                 # Clean up failed resources
@@ -103,7 +122,56 @@ class PlaywrightBrowser:
             self.page = None
             self.browser = None
             self.playwright = None
+            if self._cdp_session:
+                try:
+                    await self._cdp_session.detach()
+                except Exception as e:
+                    logger.warning(f"Failed to detach CDP session during cleanup: {e}")
+                self._cdp_session = None
     
+    async def start_tracing(self) -> None:
+        """Start tracing by listening to high-level Playwright events."""
+        if not self.page:
+            logger.error("Cannot start tracing without a page.")
+            return
+
+        # Define a generic handler
+        def create_handler(event_name):
+            def handler(payload):
+                try:
+                    # For simplicity, we'll just log the event name.
+                    # In a real scenario, you might want to serialize the payload.
+                    event_data = {"type": "playwright_event", "event": event_name, "url": self.page.url}
+                    asyncio.run_coroutine_threadsafe(self._trace_events_queue.put(event_data), self._loop)
+                    print(f"Playwright event captured and queued: {event_name} on {self.page.url}")
+                except Exception as e:
+                    print(f"Error handling playwright event {event_name}: {e}")
+            return handler
+
+        # List of events to listen to
+        events_to_listen = [
+            "close", "crash", "domcontentloaded", "download", "filechooser",
+            "frameattached", "framedetached", "framenavigated", "load", "pageerror",
+            "popup", "request", "requestfailed", "requestfinished", "response", "websocket"
+        ]
+        
+        # Clear existing listeners to avoid duplicates
+        if hasattr(self, '_event_handlers'):
+            for event, handler in self._event_handlers.items():
+                try:
+                    self.page.remove_listener(event, handler)
+                except Exception as e:
+                    logger.warning(f"Could not remove listener for {event}: {e}")
+
+        # Attach new listeners
+        self._event_handlers = {}
+        for event_name in events_to_listen:
+            handler = create_handler(event_name)
+            self._event_handlers[event_name] = handler
+            self.page.on(event_name, handler)
+        
+        logger.info(f"Attached high-level Playwright event listeners to page: {self.page.url}")
+
     async def _ensure_browser(self):
         """Ensure the browser is started"""
         if not self.browser or not self.page:
@@ -113,24 +181,23 @@ class PlaywrightBrowser:
     async def _ensure_page(self):
         """Ensure the page is created and update to the current active tab (rightmost tab)"""
         await self._ensure_browser()
-        if not self.page:
-            self.page = await self.browser.new_page()
-        else:
-            # Get all contexts
-            contexts = self.browser.contexts
-            if contexts:
-                # Get all pages in the current context
-                current_context = contexts[0]
-                pages = current_context.pages
-                
-                if pages:
-                    # Get the rightmost tab (usually the most recently opened page)
-                    rightmost_page = pages[-1]
-                    
-                    # Update if the current page is not the rightmost tab
-                    if self.page != rightmost_page:
-                        # Update to the rightmost tab
-                        self.page = rightmost_page
+        
+        # Determine the currently active (rightmost) page
+        rightmost_page = None
+        if self.browser and self.browser.contexts:
+            pages = self.browser.contexts[0].pages
+            if pages:
+                rightmost_page = pages[-1]
+        
+        # If we have a rightmost page and it's different from our current tracked page,
+        # update our tracked page and re-initialize the tracer on it.
+        if rightmost_page and self.page != rightmost_page:
+            old_url = self.page.url if self.page else "N/A"
+            new_url = rightmost_page.url
+            logger.info(f"Switching active page. Old: {old_url}, New: {new_url}")
+            self.page = rightmost_page
+            # Re-start tracing on the new page to capture its events
+            await self.start_tracing()
     
     async def wait_for_page_load(self, timeout: int = 15) -> bool:
         """Wait for the page to finish loading, waiting up to the specified timeout
@@ -410,23 +477,26 @@ class PlaywrightBrowser:
         Args:
             url: URL to navigate to
             timeout: Navigation timeout (milliseconds), default is 60 seconds
+        Returns:
+            ToolResult: Result of navigation operation
         """
         await self._ensure_page()
+        
         try:
-            # Clear cache as the page is about to change
-            self.page.interactive_elements_cache = []
-            try:
-                await self.page.goto(url, timeout=timeout)
-            except Exception as e:
-                logger.warning(f"Failed to navigate to {url}: {str(e)}")
+            await self.page.goto(url, timeout=timeout)
+            # After a successful navigation, we MUST re-attach the tracer to the new page context
+            await self.start_tracing()
+            logger.info(f"Successfully navigated to {url} and re-attached tracer.")
             return ToolResult(
                 success=True,
-                data={
-                    "interactive_elements": await self._extract_interactive_elements(),
-                }
+                message=f"Successfully navigated to {url}"
             )
         except Exception as e:
-            return ToolResult(success=False, message=f"Failed to navigate to {url}: {str(e)}")
+            logger.error(f"Failed to navigate to {url}: {e}", exc_info=True)
+            return ToolResult(
+                success=False,
+                message=f"Failed to navigate to {url}: {e}"
+            )
     
     async def restart(self, url: str) -> ToolResult:
         """Restart the browser and navigate to the specified URL"""
@@ -604,3 +674,51 @@ class PlaywrightBrowser:
         if max_lines is not None:
             logs = logs[-max_lines:]
         return ToolResult(success=True, data={"logs": logs})
+
+    async def get_next_trace_event(self) -> Optional[Dict[str, Any]]:
+        """Get the next trace event from the queue."""
+        if self._trace_events_queue.empty():
+            return None
+        return await self._trace_events_queue.get()
+
+    async def _on_event(self, event_type: str, event_payload):
+        """Unified event handler for high-level Playwright events."""
+        url = ""
+        try:
+            # Attempt to get the URL from the event payload, specific to event type
+            if hasattr(event_payload, 'url'):
+                url = event_payload.url
+            elif hasattr(event_payload, 'request') and hasattr(event_payload.request, 'url'):
+                url = event_payload.request.url
+            elif hasattr(event_payload, 'frame'):
+                url = event_payload.frame.url
+        except Exception:
+            # Some events might not have a URL or might be structured differently
+            pass
+        
+        event_data = {
+            "type": "playwright_event",
+            "event": event_type,
+            "url": url
+        }
+        
+        # Using run_coroutine_threadsafe for thread safety from Playwright's sync context
+        if self._loop:
+            future = asyncio.run_coroutine_threadsafe(self._trace_events_queue.put(event_data), self._loop)
+            try:
+                future.result(timeout=5)  # Add a timeout to prevent indefinite blocking
+            except Exception as e:
+                logger.error(f"Error queuing Playwright event: {e}")
+
+    async def _attach_page_listeners(self, page: Page):
+        """Attach all high-level event listeners to the page."""
+        event_types = [
+            "close", "console", "crash", "dialog", "domcontentloaded", "download",
+            "filechooser", "frameattached", "framedetached", "framenavigated",
+            "load", "pageerror", "popup", "request", "requestfailed",
+            "requestfinished", "response", "worker"
+        ]
+        for event_type in event_types:
+            # Use a lambda to capture the current event_type
+            page.on(event_type, lambda payload, et=event_type: self._on_event(et, payload))
+        logger.info(f"Attached high-level Playwright event listeners to page: {page.url}")

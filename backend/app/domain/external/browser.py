@@ -77,3 +77,11 @@ class Browser(Protocol):
     async def console_view(self, max_lines: Optional[int] = None) -> ToolResult:
         """View console output"""
         ...
+
+    async def start_tracing(self) -> None:
+        """Start tracing browser events."""
+        ...
+
+    async def get_next_trace_event(self) -> Optional[dict]:
+        """Get the next trace event."""
+        ...

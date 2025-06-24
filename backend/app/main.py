@@ -1,11 +1,12 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
 import asyncio
 
-from app.interfaces.api.routes import router
-from app.application.services.agent_service import AgentService
+from app.interfaces.api.router import router as core_api_router
+from app.interfaces.api.routes.session import router as session_router
+from app.dependencies import agent_service_instance as agent_service
 from app.infrastructure.config import get_settings
 from app.infrastructure.logging import setup_logging
 from app.interfaces.errors.exception_handlers import register_exception_handlers
@@ -17,7 +18,6 @@ from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.infrastructure.repositories.mongo_agent_repository import MongoAgentRepository
 from app.infrastructure.repositories.mongo_session_repository import MongoSessionRepository
 from app.infrastructure.external.task.redis_task import RedisStreamTask
-from app.interfaces.api.routes import get_agent_service
 from app.infrastructure.models.documents import AgentDocument, SessionDocument
 from app.infrastructure.utils.llm_json_parser import LLMJsonParser
 from beanie import init_beanie
@@ -28,32 +28,6 @@ logger = logging.getLogger(__name__)
 
 # Load configuration
 settings = get_settings()
-
-
-def create_agent_service() -> AgentService:
-    search_engine = None
-    # Initialize search engine only if both API key and engine ID are set
-    if settings.google_search_api_key and settings.google_search_engine_id:
-        logger.info("Initializing Google Search Engine")
-        search_engine = GoogleSearchEngine(
-            api_key=settings.google_search_api_key, 
-            cx=settings.google_search_engine_id
-        )
-    else:
-        logger.warning("Google Search Engine not initialized: missing API key or engine ID")
-
-    return AgentService(
-        llm=OpenAILLM(),
-        agent_repository=MongoAgentRepository(),
-        session_repository=MongoSessionRepository(),
-        sandbox_cls=DockerSandbox,
-        task_cls=RedisStreamTask,
-        json_parser=LLMJsonParser(),
-        search_engine=search_engine,
-    )
-
-# Create agent service instance
-agent_service = create_agent_service()
 
 async def shutdown() -> None:
     """Cleanup function that will be called when the application is shutting down"""
@@ -101,8 +75,8 @@ async def lifespan(app: FastAPI):
         await get_redis().shutdown()
         await shutdown()
 
+# Create FastAPI app
 app = FastAPI(title="Manus AI Agent", lifespan=lifespan, timeout_graceful_shutdown=5)
-app.dependency_overrides[get_agent_service] = lambda: agent_service
 
 # Configure CORS
 app.add_middleware(
@@ -116,5 +90,38 @@ app.add_middleware(
 # Register exception handlers
 register_exception_handlers(app)
 
-# Register routes with dependency injection
-app.include_router(router, prefix="/api/v1")
+# Create a main router
+api_v1_router = APIRouter()
+
+# Include all the different routers
+api_v1_router.include_router(core_api_router) # The original core APIs
+api_v1_router.include_router(session_router, prefix="/session", tags=["session"]) # Our new router
+
+# Mount the main router
+app.include_router(api_v1_router, prefix="/api/v1")
+
+@app.on_event("startup")
+async def startup_event():
+    """Application startup event"""
+    settings = get_settings()
+    if settings.mongodb_uri:
+        await get_mongodb().connect(
+            uri=settings.mongodb_uri,
+            db_name=settings.mongodb_database
+        )
+    if settings.redis_host:
+        await get_redis().connect(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            db=settings.redis_db,
+            password=settings.redis_password
+        )
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Application shutdown event"""
+    settings = get_settings()
+    if settings.mongodb_uri:
+        await get_mongodb().disconnect()
+    if settings.redis_host:
+        await get_redis().disconnect()

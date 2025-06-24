@@ -1,6 +1,6 @@
 from typing import Any, Generic, Optional, TypeVar, List
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.interfaces.schemas.event import AgentSSEEvent
 from app.domain.models.session import SessionStatus
 
@@ -53,3 +53,14 @@ class ShellViewResponse(BaseModel):
 class FileViewResponse(BaseModel):
     content: str
     file: str
+
+class AgentResponse(BaseModel):
+    id: str
+    name: str
+
+class SessionResponse(BaseModel):
+    id: str
+    success: bool
+    data: Optional[dict] = None
+    debug_screenshot_base64: Optional[str] = None
+    debug_html: Optional[str] = None
